@@ -16,7 +16,7 @@
 
 #define LOG_TAG "libpixelpowerstats"
 
-#include <log/log.h>
+#include <android-base/logging.h>
 #include <pixelpowerstats/PowerStats.h>
 
 namespace android {
@@ -26,64 +26,61 @@ namespace stats {
 namespace V1_0 {
 namespace implementation {
 
-PowerStats::PowerStats() = default;
-
 void PowerStats::setRailDataProvider(std::unique_ptr<IRailDataProvider> dataProvider) {
     mRailDataProvider = std::move(dataProvider);
 }
 
-void PowerStats::setPowerEntityConfig(const std::vector<PowerEntityConfig> &configs) {
-    for (uint32_t i = 0; i < configs.size(); ++i) {
-        auto &entityConfig = configs[i];
-
-        // Inserting each PowerEntityInfo into mPowerEntityInfos
-        mPowerEntityInfos.push_back({i, entityConfig.name, entityConfig.type});
-
-        if (!entityConfig.states.empty()) {
-            // Inserting each PowerEntityStateSpace into mPowerEntityStateSpaces
-            mPowerEntityStateSpaces[i] = {i, {}};
-
-            // Inserting each PowerEntityStateInfo into its corresponding PowerEntityStateSpace
-            mPowerEntityStateSpaces[i].states.resize(entityConfig.states.size());
-            for (uint32_t j = 0; j < entityConfig.states.size(); ++j) {
-                mPowerEntityStateSpaces[i].states[j] = {j, entityConfig.states[j]};
-            }
-        }
-    }
-}
-
 Return<void> PowerStats::getRailInfo(getRailInfo_cb _hidl_cb) {
-    if (mRailDataProvider) {
-        return mRailDataProvider->getRailInfo(_hidl_cb);
-    } else {
+    if (!mRailDataProvider) {
         _hidl_cb({}, Status::NOT_SUPPORTED);
         return Void();
     }
+
+    return mRailDataProvider->getRailInfo(_hidl_cb);
 }
 
 Return<void> PowerStats::getEnergyData(const hidl_vec<uint32_t> &railIndices,
                                        getEnergyData_cb _hidl_cb) {
-    if (mRailDataProvider) {
-        return mRailDataProvider->getEnergyData(railIndices, _hidl_cb);
-    } else {
+    if (!mRailDataProvider) {
         _hidl_cb({}, Status::NOT_SUPPORTED);
         return Void();
     }
+
+    return mRailDataProvider->getEnergyData(railIndices, _hidl_cb);
 }
 
 Return<void> PowerStats::streamEnergyData(uint32_t timeMs, uint32_t samplingRate,
                                           streamEnergyData_cb _hidl_cb) {
-    if (mRailDataProvider) {
-        return mRailDataProvider->streamEnergyData(timeMs, samplingRate, _hidl_cb);
-    } else {
+    if (!mRailDataProvider) {
         _hidl_cb({}, 0, 0, Status::NOT_SUPPORTED);
         return Void();
+    }
+
+    return mRailDataProvider->streamEnergyData(timeMs, samplingRate, _hidl_cb);
+}
+
+uint32_t PowerStats::addPowerEntity(std::string name, PowerEntityType type) {
+    uint32_t id = mPowerEntityInfos.size();
+    mPowerEntityInfos.push_back({id, name, type});
+    return id;
+}
+
+void PowerStats::addStateResidencyDataProvider(std::shared_ptr<IStateResidencyDataProvider> p) {
+    std::vector<PowerEntityStateSpace> stateSpaces = p->getStateSpaces();
+    for (auto it : stateSpaces) {
+        mPowerEntityStateSpaces[it.powerEntityId] = it;
+        mStateResidencyDataProviders[it.powerEntityId] = p;
     }
 }
 
 Return<void> PowerStats::getPowerEntityInfo(getPowerEntityInfo_cb _hidl_cb) {
-    _hidl_cb(mPowerEntityInfos,
-             mPowerEntityInfos.empty() ? Status::NOT_SUPPORTED : Status::SUCCESS);
+    // If not configured, return NOT_SUPPORTED
+    if (mPowerEntityInfos.empty()) {
+        _hidl_cb({}, Status::NOT_SUPPORTED);
+        return Void();
+    }
+
+    _hidl_cb(mPowerEntityInfos, Status::SUCCESS);
     return Void();
 }
 
@@ -95,33 +92,88 @@ Return<void> PowerStats::getPowerEntityStateInfo(const hidl_vec<uint32_t> &power
         return Void();
     }
 
-    std::vector<PowerEntityStateSpace> s;
+    std::vector<PowerEntityStateSpace> stateSpaces;
 
     // If powerEntityIds is empty then return state space info for all entities
     if (powerEntityIds.size() == 0) {
-        s.reserve(mPowerEntityStateSpaces.size());
+        stateSpaces.reserve(mPowerEntityStateSpaces.size());
         for (auto i : mPowerEntityStateSpaces) {
-            s.push_back(i.second);
+            stateSpaces.push_back(i.second);
         }
-        _hidl_cb(s, Status::SUCCESS);
+        _hidl_cb(stateSpaces, Status::SUCCESS);
         return Void();
     }
 
     // Return state space information only for valid ids
-    for (const uint32_t i : powerEntityIds) {
-        if (mPowerEntityStateSpaces.count(i) != 0) {
-            s.push_back(mPowerEntityStateSpaces[i]);
+    auto ret = Status::SUCCESS;
+    stateSpaces.reserve(powerEntityIds.size());
+    for (const uint32_t id : powerEntityIds) {
+        auto stateSpace = mPowerEntityStateSpaces.find(id);
+        if (stateSpace != mPowerEntityStateSpaces.end()) {
+            stateSpaces.push_back(stateSpace->second);
+        } else {
+            ret = Status::INVALID_INPUT;
         }
     }
 
-    _hidl_cb(s, s.empty() ? Status::INVALID_INPUT : Status::SUCCESS);
+    _hidl_cb(stateSpaces, ret);
     return Void();
 }
 
 Return<void> PowerStats::getPowerEntityStateResidencyData(
     const hidl_vec<uint32_t> &powerEntityIds, getPowerEntityStateResidencyData_cb _hidl_cb) {
-    (void)powerEntityIds;
-    _hidl_cb({}, Status::NOT_SUPPORTED);
+    // If not configured, return NOT_SUPPORTED
+    if (mStateResidencyDataProviders.empty() || mPowerEntityStateSpaces.empty()) {
+        _hidl_cb({}, Status::NOT_SUPPORTED);
+        return Void();
+    }
+
+    // If powerEntityIds is empty then return data for all supported entities
+    if (powerEntityIds.size() == 0) {
+        std::vector<uint32_t> ids;
+        for (auto stateSpace : mPowerEntityStateSpaces) {
+            ids.push_back(stateSpace.first);
+        }
+        return getPowerEntityStateResidencyData(ids, _hidl_cb);
+    }
+
+    std::map<uint32_t, PowerEntityStateResidencyResult> stateResidencies;
+    std::vector<PowerEntityStateResidencyResult> results;
+    results.reserve(powerEntityIds.size());
+
+    // return results for only the given powerEntityIds
+    bool invalidInput = false;
+    bool filesystemError = false;
+    for (auto id : powerEntityIds) {
+        auto dataProvider = mStateResidencyDataProviders.find(id);
+        // skip if the given powerEntityId does not have an associated StateResidencyDataProvider
+        if (dataProvider == mStateResidencyDataProviders.end()) {
+            invalidInput = true;
+            continue;
+        }
+
+        // get the results if we have not already done so.
+        if (stateResidencies.find(id) == stateResidencies.end()) {
+            if (!dataProvider->second->getResults(stateResidencies)) {
+                filesystemError = true;
+            }
+        }
+
+        // append results
+        auto stateResidency = stateResidencies.find(id);
+        if (stateResidency != stateResidencies.end()) {
+            results.push_back(stateResidency->second);
+        }
+    }
+
+    auto ret = Status::SUCCESS;
+    if (filesystemError) {
+        ret = Status::FILESYSTEM_ERROR;
+    } else if (invalidInput) {
+        ret = Status::INVALID_INPUT;
+    }
+
+    _hidl_cb(results, ret);
     return Void();
 }
 
